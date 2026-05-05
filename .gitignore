@@ -11,3 +11,4 @@ models/*.pt
 models/*.bin
 *.db
 .DS_Store
+models/
