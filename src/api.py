@@ -56,8 +56,8 @@ def save_document(result: Dict[str, Any], text: str):
     cursor = conn.cursor()
     cursor.execute("""
         INSERT OR REPLACE INTO documents 
-        (id, text, doc_type, confidence, entities, summary, similar_docs)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        (id, text, doc_type, confidence, entities, summary, similar_docs, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     """, (
         result["doc_id"],
         text,
@@ -108,6 +108,7 @@ class DocumentResponse(BaseModel):
     entities: List[EntityResponse]
     summary: str
     similar_docs: List[SimilarDocResponse]
+    extracted_fields: Dict[str, Any]
     message: str = "Document analyzed successfully"
 
 class DocumentListResponse(BaseModel):
@@ -159,7 +160,8 @@ def analyze(request: DocumentRequest):
             confidence=result["confidence"],
             entities=[EntityResponse(**e) for e in result["entities"]],
             summary=result["summary"],
-            similar_docs=[SimilarDocResponse(**d) for d in result["similar_docs"]]
+            similar_docs=[SimilarDocResponse(**d) for d in result["similar_docs"]],
+            extracted_fields=result["extracted_fields"]
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
