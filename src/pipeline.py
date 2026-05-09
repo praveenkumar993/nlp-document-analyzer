@@ -1,211 +1,28 @@
-from fastapi import requests
-
 import torch
+import re
+import os
+import json
+from chromadb.config import Settings
 from transformers import (
     DistilBertTokenizerFast,
     DistilBertForTokenClassification,
     BertTokenizerFast,
-    BertForSequenceClassification
+    BertForSequenceClassification,
+    pipeline as hf_pipeline
 )
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, List, Dict, Any
 import chromadb
 from sentence_transformers import SentenceTransformer
-import os
 from dotenv import load_dotenv
-import json
-import requests
 
 load_dotenv()
-
-import re
-
-# ---- Document Type Detector ----
-def detect_document_type(text: str) -> str:
-    text_lower = text.lower()
-
-    # Invoice patterns
-    invoice_keywords = [
-        "invoice", "total due", "payment due", "invoice number",
-        "bill to", "ship to", "subtotal", "tax", "amount due",
-        "purchase order", "receipt", "invoice date", "due date"
-    ]
-    invoice_score = sum(1 for kw in invoice_keywords if kw in text_lower)
-
-    # Email patterns
-    email_keywords = [
-        "dear", "regards", "sincerely", "hi ", "hello",
-        "subject:", "from:", "to:", "cc:", "best regards",
-        "please find", "attached", "let me know", "thank you for"
-    ]
-    email_score = sum(1 for kw in email_keywords if kw in text_lower)
-
-    # Support ticket patterns
-    ticket_keywords = [
-        "ticket", "issue", "priority", "bug", "error",
-        "support", "request", "problem", "resolve", "status",
-        "assigned to", "reported by", "severity", "incident"
-    ]
-    ticket_score = sum(1 for kw in ticket_keywords if kw in text_lower)
-
-    # Decide based on scores
-    scores = {
-        "Invoice": invoice_score,
-        "Email": email_score,
-        "Support Ticket": ticket_score
-    }
-
-    max_type = max(scores, key=scores.get)
-    max_score = scores[max_type]
-
-    # Only use rule-based if confident enough
-    if max_score >= 2:
-        return max_type
-    else:
-        return "General"  # fall back to ML classifier
-    
-# ---- Specialized Field Extractor ----
-def extract_invoice_fields(text: str) -> dict:
-    fields = {}
-
-    # Invoice number
-    inv_match = re.search(r'invoice\s*#?\s*:?\s*([A-Z0-9\-]+)', text, re.IGNORECASE)
-    if inv_match:
-        fields["invoice_number"] = inv_match.group(1)
-
-    # Order number
-    order_match = re.search(r'order\s*#?\s*:?\s*([A-Z0-9\-]+)', text, re.IGNORECASE)
-    if order_match:
-        fields["order_number"] = order_match.group(1)
-
-    # Total amount
-    amount_match = re.search(r'total\s*due\s*:?\s*\$?([\d,]+\.?\d*)', text, re.IGNORECASE)
-    if amount_match:
-        fields["total_due"] = f"${amount_match.group(1)}"
-
-    # Tax
-    tax_match = re.search(r'tax\s*:?\s*\$?([\d,]+\.?\d*)', text, re.IGNORECASE)
-    if tax_match:
-        fields["tax"] = f"${tax_match.group(1)}"
-
-    # Invoice date
-    date_match = re.search(r'invoice\s*date\s*:?\s*([A-Za-z]+\s+\d+,?\s+\d{4}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})', text, re.IGNORECASE)
-    if date_match:
-        fields["invoice_date"] = date_match.group(1)
-
-    # Due date
-    due_match = re.search(r'due\s*date\s*:?\s*([A-Za-z]+\s+\d+,?\s+\d{4}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})', text, re.IGNORECASE)
-    if due_match:
-        fields["due_date"] = due_match.group(1)
-
-    # Vendor name (From section)
-    vendor_match = re.search(r'from:\s*\n?(.+?)(?:\n|$)', text, re.IGNORECASE)
-    if vendor_match:
-        fields["vendor"] = vendor_match.group(1).strip()
-
-    # Client name (To section)
-    client_match = re.search(r'to:\s*\n?(.+?)(?:\n|$)', text, re.IGNORECASE)
-    if client_match:
-        fields["client"] = client_match.group(1).strip()
-
-    return fields
-
-
-def extract_email_fields(text: str) -> dict:
-    fields = {}
-
-    # Subject
-    subject_match = re.search(r'subject\s*:\s*(.+?)(?:\n|$)', text, re.IGNORECASE)
-    if subject_match:
-        fields["subject"] = subject_match.group(1).strip()
-
-    # From
-    from_match = re.search(r'from\s*:\s*(.+?)(?:\n|$)', text, re.IGNORECASE)
-    if from_match:
-        fields["from"] = from_match.group(1).strip()
-
-    # To
-    to_match = re.search(r'to\s*:\s*(.+?)(?:\n|$)', text, re.IGNORECASE)
-    if to_match:
-        fields["to"] = to_match.group(1).strip()
-
-    # Detect intent
-    text_lower = text.lower()
-    if any(w in text_lower for w in ["complaint", "issue", "problem", "unhappy", "disappointed"]):
-        fields["intent"] = "Complaint"
-    elif any(w in text_lower for w in ["request", "please", "could you", "can you"]):
-        fields["intent"] = "Request"
-    elif any(w in text_lower for w in ["thank", "thanks", "appreciate"]):
-        fields["intent"] = "Appreciation"
-    elif any(w in text_lower for w in ["follow up", "following up", "checking in"]):
-        fields["intent"] = "Follow Up"
-    else:
-        fields["intent"] = "General"
-
-    return fields
-
-
-def extract_ticket_fields(text: str) -> dict:
-    fields = {}
-
-    # Ticket ID
-    ticket_match = re.search(r'ticket\s*#?\s*:?\s*([A-Z0-9\-]+)', text, re.IGNORECASE)
-    if ticket_match:
-        fields["ticket_id"] = ticket_match.group(1)
-
-    # Priority
-    priority_match = re.search(r'priority\s*:?\s*(low|medium|high|critical|urgent)', text, re.IGNORECASE)
-    if priority_match:
-        fields["priority"] = priority_match.group(1).capitalize()
-    else:
-        text_lower = text.lower()
-        if any(w in text_lower for w in ["urgent", "critical", "asap", "immediately"]):
-            fields["priority"] = "High"
-        elif any(w in text_lower for w in ["low", "minor", "whenever"]):
-            fields["priority"] = "Low"
-        else:
-            fields["priority"] = "Medium"
-
-    # Status
-    status_match = re.search(r'status\s*:?\s*(open|closed|pending|resolved|in progress)', text, re.IGNORECASE)
-    if status_match:
-        fields["status"] = status_match.group(1).capitalize()
-    else:
-        fields["status"] = "Open"
-
-    # Issue type
-    text_lower = text.lower()
-    if any(w in text_lower for w in ["login", "password", "access", "authentication"]):
-        fields["issue_type"] = "Access Issue"
-    elif any(w in text_lower for w in ["crash", "error", "bug", "not working"]):
-        fields["issue_type"] = "Bug Report"
-    elif any(w in text_lower for w in ["slow", "performance", "timeout", "latency"]):
-        fields["issue_type"] = "Performance Issue"
-    elif any(w in text_lower for w in ["install", "setup", "configure"]):
-        fields["issue_type"] = "Installation Issue"
-    else:
-        fields["issue_type"] = "General Issue"
-
-    return fields
-
-
-def extract_fields(doc_type: str, text: str) -> dict:
-    if doc_type == "Invoice":
-        return extract_invoice_fields(text)
-    elif doc_type == "Email":
-        return extract_email_fields(text)
-    elif doc_type == "Support Ticket":
-        return extract_ticket_fields(text)
-    else:
-        return {}
-    
-
 
 # ---- Labels ----
 NER_LABELS = ["O", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC"]
 CLASSIFIER_LABELS = ["World", "Sports", "Business", "Sci/Tech"]
 
-# ---- Devices ----
+# ---- Device ----
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
 
@@ -225,18 +42,428 @@ cls_model.eval()
 print("Loading Sentence Transformer...")
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
-print("Setting up ChromaDB...")
-chroma_client = chromadb.Client()
-collection = chroma_client.get_or_create_collection("documents")
+print("Loading DistilBART Summarizer...")
+bart_summarizer = hf_pipeline(
+    task="summarization",
+    model="sshleifer/distilbart-cnn-12-6",
+    device=-1  # CPU
+)
 
-print("Setting up Summarizer...")
-HF_API_URL = "https://api-inference.huggingface.co/models/facebook/bart-large-cnn"
-HF_TOKEN = os.getenv("HF_TOKEN")
-HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
+print("Setting up ChromaDB...")
+
+chroma_client = chromadb.Client(
+    Settings(
+        anonymized_telemetry=False
+    )
+)
+
+collection = chroma_client.get_or_create_collection("documents")
 
 print("All models loaded!")
 
-# ---- LangGraph State ----
+
+# ================================================================
+# DOCUMENT TYPE DETECTION — Rule-based first, ML fallback
+# ================================================================
+def detect_document_type(text: str) -> str:
+    text_lower = text.lower()
+
+    invoice_keywords = [
+        "invoice", "total due", "payment due", "invoice number",
+        "bill to", "ship to", "subtotal", "amount due",
+        "purchase order", "invoice date", "due date", "receipt",
+        "gstin", "hsn", "tax invoice", "proforma"
+    ]
+    email_keywords = [
+        "dear", "regards", "sincerely", "best regards",
+        "subject:", "please find", "attached", "let me know",
+        "thank you for", "hi ", "hello ", "greetings", "warm regards"
+    ]
+    ticket_keywords = [
+        "ticket", "priority", "bug", "assigned to",
+        "reported by", "severity", "incident", "resolve",
+        "support request", "status:", "issue #", "case #",
+        "escalation", "sla", "helpdesk"
+    ]
+
+    invoice_score = sum(1 for kw in invoice_keywords if kw in text_lower)
+    email_score = sum(1 for kw in email_keywords if kw in text_lower)
+    ticket_score = sum(1 for kw in ticket_keywords if kw in text_lower)
+
+    scores = {
+        "Invoice": invoice_score,
+        "Email": email_score,
+        "Support Ticket": ticket_score
+    }
+    max_type = max(scores, key=scores.get)
+    max_score = scores[max_type]
+
+    return max_type if max_score >= 2 else "General"
+
+
+# ================================================================
+# FIELD EXTRACTORS — per document type
+# ================================================================
+def extract_invoice_fields(text: str) -> dict:
+    fields = {}
+
+    patterns = {
+       "invoice_number":  r'invoice\s*(?:number|#|no\.?)\s*[:\-]?\s*([A-Z]{2,10}-\d{2,6}(?:-[A-Z0-9]+)*)',
+        "order_number":   r'order\s*(?:number|#|no\.?)?\s*[:\-]?\s*([A-Z0-9\-]{3,})',
+        "total_due":      r'total\s*due\s*[:\-]?\s*(?:rs\.?|inr|₹|\$)?\s*([\d,]+\.\d+|[\d,]+)',
+        "tax":            r'\btax\b\s*[:\-]?\s*(?:rs\.?|inr|₹|\$)?\s*([\d,]+\.?\d*)',
+        "sub_total":      r'sub\s*total\s*[:\-]?\s*(?:rs\.?|inr|₹|\$)?\s*([\d,]+\.?\d*)',
+        "invoice_date": r'invoice\s*date\s*[:\-]?\s*([A-Za-z]+\s+\d{1,2},?\s*\d{4}|\d{1,2}\s+[A-Za-z]+\s+\d{4}|\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})',
+        "due_date": r'due\s*date\s*[:\-]?\s*([A-Za-z]+\s+\d{1,2},?\s*\d{4}|\d{1,2}\s+[A-Za-z]+\s+\d{4}|\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})',
+    }
+
+    for field, pattern in patterns.items():
+        if field == "total_due":
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            if matches:
+                val = matches[-1].strip()
+            else:
+                continue
+        else:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if not match:
+                continue
+            val = match.group(1).strip()
+        if field in ["total_due", "tax", "sub_total"]:
+            val = f"₹{val}" if any(c in text for c in ["₹", "INR", "Rs", "Crore", "Lakh"]) else f"${val}"
+        fields[field] = val
+
+    # Vendor Extraction — smarter multiline block parsing
+    from_block = re.search(
+        r'from\s*:\s*(.*?)bill\s*to\s*:',
+        text,
+        re.IGNORECASE | re.DOTALL
+    )
+
+    if from_block:
+        block = from_block.group(1)
+
+        # Split lines and clean
+        lines = [
+            l.strip()
+            for l in block.split("\n")
+            if len(l.strip()) > 3
+        ]
+
+        # Look for likely company names
+        vendor_candidates = [
+            l for l in lines
+            if any(word in l.lower() for word in [
+                "limited",
+                "ltd",
+                "pvt",
+                "corp",
+                "solutions",
+                "technologies",
+                "services",
+                "systems"
+            ])
+        ]
+
+        if vendor_candidates:
+            vendor = vendor_candidates[0]
+
+            # Remove trailing invoice/order/date text
+            vendor = re.split(
+                r'invoice\s*number|order\s*number|invoice\s*date|due\s*date',
+                vendor,
+                flags=re.IGNORECASE
+            )[0].strip()
+
+            fields["vendor"] = vendor
+
+    # Client — line after "To:" or "Bill To:"
+    to_match = re.search(r'(?:^|\n)\s*(?:bill\s*to|to)\s*:\s*\n?\s*(.+)', text, re.IGNORECASE)
+    if to_match:
+        fields["client"] = to_match.group(1).strip()
+
+    # GSTIN
+    gstin_match = re.search(r'gstin\s*[:\-]?\s*([A-Z0-9]{15})', text, re.IGNORECASE)
+    if gstin_match:
+        fields["gstin"] = gstin_match.group(1).strip()
+
+    return fields
+
+
+def extract_email_fields(text: str) -> dict:
+    fields = {}
+    lines = text.strip().split("\n")
+
+    for line in lines[:10]:
+        stripped = line.strip()
+        lower = stripped.lower()
+        if lower.startswith("subject:"):
+            fields["subject"] = stripped.split(":", 1)[1].strip()
+        elif lower.startswith("from:"):
+            fields["from"] = stripped.split(":", 1)[1].strip()
+        elif lower.startswith("to:"):
+            fields["to"] = stripped.split(":", 1)[1].strip()
+        elif lower.startswith("cc:"):
+            fields["cc"] = stripped.split(":", 1)[1].strip()
+        elif lower.startswith("date:"):
+            fields["date"] = stripped.split(":", 1)[1].strip()
+
+    text_lower = text.lower()
+    if any(w in text_lower for w in ["complaint", "unhappy", "disappointed", "not satisfied", "issue with", "problem with"]):
+        fields["intent"] = "Complaint"
+    elif any(w in text_lower for w in ["follow up", "following up", "checking in", "any update", "status update"]):
+        fields["intent"] = "Follow Up"
+    elif any(w in text_lower for w in ["thank you", "thanks", "appreciate", "grateful", "well received"]):
+        fields["intent"] = "Appreciation"
+    elif any(w in text_lower for w in ["please find", "attached", "quotation", "proposal", "request", "partnership"]):
+        fields["intent"] = "Request"
+    else:
+        fields["intent"] = "General"
+
+    return fields
+
+
+def extract_ticket_fields(text: str) -> dict:
+    fields = {}
+
+    ticket_match = re.search(
+    r'(?:ticket|case|issue)\s*(?:id|number|#)?\s*[:\-]?\s*([A-Z]{1,5}-\d{2,6}(?:-\d{1,6})?)',
+    text,
+    re.IGNORECASE
+    )
+    if ticket_match:
+        fields["ticket_id"] = ticket_match.group(1).strip()
+
+    priority_match = re.search(
+    r'priority\s*(?:[:\-]?\s*)?(low|medium|high|critical|urgent|p0|p1|p2|p3)',text,re.IGNORECASE)
+    if priority_match:
+        fields["priority"] = priority_match.group(1).capitalize()
+    else:
+        text_lower = text.lower()
+        if any(w in text_lower for w in ["urgent", "critical", "asap", "immediately", "blocker", "p0", "p1"]):
+            fields["priority"] = "High"
+        elif any(w in text_lower for w in ["low priority", "minor", "whenever possible", "p3", "p4"]):
+            fields["priority"] = "Low"
+        else:
+            fields["priority"] = "Medium"
+
+    status_match = re.search(r'status\s*(?:[:\-]?\s*)?(open|closed|pending|resolved|in\s*progress)',text,re.IGNORECASE)
+    fields["status"] = status_match.group(1).strip().capitalize() if status_match else "Open"
+
+    text_lower = text.lower()
+    if any(w in text_lower for w in ["login", "password", "access", "authentication", "permission", "ldap", "sso"]):
+        fields["issue_type"] = "Access Issue"
+    elif any(w in text_lower for w in ["crash", "error", "bug", "not working", "broken", "failed", "exception"]):
+        fields["issue_type"] = "Bug Report"
+    elif any(w in text_lower for w in ["slow", "performance", "timeout", "latency", "hang", "freeze"]):
+        fields["issue_type"] = "Performance Issue"
+    elif any(w in text_lower for w in ["install", "setup", "configure", "deployment", "update", "upgrade"]):
+        fields["issue_type"] = "Installation Issue"
+    else:
+        fields["issue_type"] = "General Issue"
+
+    assigned_match = re.search(
+        r'assigned\s*to\s*[:\-]?\s*([A-Za-z\s]+?)(?:department|\n|$)',
+        text,
+        re.IGNORECASE
+    )
+    if assigned_match:
+        fields["assigned_to"] = assigned_match.group(1).strip()
+
+    reported_match = re.search(
+        r'reported\s*by\s*[:\-]?\s*([A-Za-z\s]+?)(?:date|\n|$)',
+        text,
+        re.IGNORECASE
+    )
+    if reported_match:
+        fields["reported_by"] = reported_match.group(1).strip()
+
+    return fields
+
+
+def extract_fields(doc_type: str, text: str) -> dict:
+    if doc_type == "Invoice":
+        return extract_invoice_fields(text)
+    elif doc_type == "Email":
+        return extract_email_fields(text)
+    elif doc_type == "Support Ticket":
+        return extract_ticket_fields(text)
+    return {}
+
+
+# ================================================================
+# ENTITY CLEANING
+# ================================================================
+NOISE_ENTITIES = {
+    "office supplies", "web design", "sample", "services", "payment",
+    "invoice", "total", "tax", "sub", "amount", "date", "number",
+    "dear", "regards", "sincerely", "hello", "hi", "subject",
+    "attached", "please", "find", "thank", "note", "items"
+}
+
+def clean_entities(entities: list) -> list:
+    cleaned = []
+    seen = set()
+    for entity in entities:
+        text = entity["text"].strip()
+        if len(text) < 3:
+            continue
+        if text.startswith("##"):
+            continue
+        if text.lower() in NOISE_ENTITIES:
+            continue
+        if text.lower() in seen:
+            continue
+        # Skip pure numbers
+        if re.match(r'^[\d\s\.,]+$', text):
+            continue
+        seen.add(text.lower())
+        cleaned.append(entity)
+    return cleaned
+
+
+# ================================================================
+# SUMMARIZER
+# ================================================================
+def generate_structured_summary(doc_type: str, text: str, entities: list, extracted_fields: dict) -> str:
+    """
+    For Invoice, Email, Support Ticket — generate precise structured summaries.
+    These are deterministic and accurate. BART is NOT used here.
+    """
+    per_entities = [e["text"].title() for e in entities if e["type"] == "PER"]
+    org_entities = [e["text"].title() for e in entities if e["type"] == "ORG"]
+    loc_entities = [e["text"].title() for e in entities if e["type"] == "LOC"]
+
+    if doc_type == "Invoice":
+        vendor = extracted_fields.get("vendor", org_entities[0] if org_entities else "the vendor")
+        client = extracted_fields.get("client", "the client")
+        total = extracted_fields.get("total_due", "N/A")
+        inv_num = extracted_fields.get("invoice_number", "N/A")
+        due = extracted_fields.get("due_date", "N/A")
+        inv_date = extracted_fields.get("invoice_date", "N/A")
+        gstin = extracted_fields.get("gstin", "")
+        gstin_str = f" (GSTIN: {gstin})" if gstin else ""
+        return (
+            f"Invoice {inv_num} issued by {vendor}{gstin_str} to {client} on {inv_date}. "
+            f"Total amount due: {total}, payment deadline: {due}."
+        )
+
+    elif doc_type == "Email":
+        subject = extracted_fields.get("subject", "")
+        sender = extracted_fields.get("from", per_entities[0] if per_entities else "the sender")
+        intent = extracted_fields.get("intent", "General")
+        org = org_entities[0] if org_entities else ""
+        loc = loc_entities[0] if loc_entities else ""
+        parts = [f"{intent} email"]
+        if subject:
+            parts.append(f"regarding \"{subject}\"")
+        if sender:
+            parts.append(f"from {sender}")
+        if org:
+            parts.append(f"at {org}")
+        if loc:
+            parts.append(f"based in {loc}")
+        return " ".join(parts) + "."
+
+    elif doc_type == "Support Ticket":
+        ticket_id = extracted_fields.get("ticket_id", "")
+        priority = extracted_fields.get("priority", "Medium")
+        issue_type = extracted_fields.get("issue_type", "General Issue")
+        status = extracted_fields.get("status", "Open")
+        assigned = extracted_fields.get("assigned_to", "")
+        reported = extracted_fields.get("reported_by", "")
+        sentences = [
+            s.strip()
+            for s in re.split(r'[.\n]', text)
+            if len(s.strip()) > 30
+        ]
+
+        filtered_sentences = [
+            s for s in sentences
+            if not any(
+                noise in s.lower()
+                for noise in [
+                    "ticket #",
+                    "priority",
+                    "status",
+                    "assigned to",
+                    "reported by",
+                    "company",
+                    "location"
+                ]
+            )
+        ]
+
+        detail = filtered_sentences[0] if filtered_sentences else ""
+        summary = f"{priority} priority {issue_type}"
+        if ticket_id:
+            summary += f" (#{ticket_id})"
+        summary += f". Status: {status}."
+        if assigned:
+            summary += f" Assigned to {assigned}."
+        if reported:
+            summary += f" Reported by {reported}."
+        if detail:
+            summary += f" {detail}."
+        return summary
+
+    return ""
+
+
+def generate_bart_summary(text: str, entities: list) -> str:
+    """
+    For News/General documents — use DistilBART for abstractive summarization.
+    BART is designed for news articles and works best here.
+    """
+    # Clean text — remove very short lines and noise
+    clean_lines = [l.strip() for l in text.split("\n") if len(l.strip()) > 20]
+    clean_text = " ".join(clean_lines)
+
+    # BART works best with 100-600 words
+    words = clean_text.split()
+    if len(words) > 500:
+        clean_text = " ".join(words[:500])
+
+    # If too short for BART — use extractive fallback
+    if len(words) < 30:
+        sentences = [s.strip() for s in text.split(".") if len(s.strip()) > 20]
+        return sentences[0] + "." if sentences else text.strip()
+
+    try:
+        result = bart_summarizer(
+            clean_text,
+            max_length=120,
+            min_length=40,
+            do_sample=False,
+            truncation=True
+        )
+        summary = result[0]["summary_text"].strip()
+        # Clean up spacing issues
+        summary = re.sub(r'\s+([.,])', r'\1', summary)
+        summary = re.sub(r'\s+', ' ', summary)
+        return summary
+    except Exception as e:
+        print(f"BART summarization failed: {e}")
+        # Extractive fallback
+        entity_names = [e["text"].lower() for e in entities]
+        sentences = [s.strip() for s in text.split(".") if len(s.strip()) > 25]
+        if not sentences:
+            return text[:200].strip()
+        scored = []
+        for i, sent in enumerate(sentences):
+            score = 4 if i == 0 else 0
+            for ent in entity_names:
+                if ent in sent.lower():
+                    score += 2
+            scored.append((score, i, sent))
+        top = sorted(scored, reverse=True)[:2]
+        ordered = [s for _, _, s in sorted(top, key=lambda x: x[1])]
+        return ". ".join(ordered).strip() + "."
+
+
+# ================================================================
+# LANGGRAPH STATE
+# ================================================================
 class DocumentState(TypedDict):
     text: str
     entities: List[Dict[str, str]]
@@ -244,31 +471,22 @@ class DocumentState(TypedDict):
     confidence: float
     summary: str
     doc_id: str
-    similar_docs: List[Dict[str, Any]]
     extracted_fields: Dict[str, Any]
     error: str
 
 
-# ---- Node 1: Preprocessor ----
+# ================================================================
+# PIPELINE NODES
+# ================================================================
 def preprocess(state: DocumentState) -> DocumentState:
     text = state["text"].strip()
-    text = " ".join(text.split())  # remove extra whitespace
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
     state["text"] = text
     state["doc_id"] = str(abs(hash(text)))[:8]
     return state
 
-def clean_entities(entities):
-    cleaned = []
-    for entity in entities:
-        text = entity["text"].strip()
-        if len(text) < 2:
-            continue
-        if text.startswith("##"):
-            continue
-        cleaned.append(entity)
-    return cleaned
 
-# ---- Node 2: NER ----
 def run_ner(state: DocumentState) -> DocumentState:
     text = state["text"]
     inputs = ner_tokenizer(
@@ -283,9 +501,7 @@ def run_ner(state: DocumentState) -> DocumentState:
         outputs = ner_model(**inputs)
 
     predictions = torch.argmax(outputs.logits, dim=-1).squeeze().tolist()
-    tokens = ner_tokenizer.convert_ids_to_tokens(
-        inputs["input_ids"].squeeze().tolist()
-    )
+    tokens = ner_tokenizer.convert_ids_to_tokens(inputs["input_ids"].squeeze().tolist())
 
     entities = []
     current_entity = None
@@ -293,22 +509,15 @@ def run_ner(state: DocumentState) -> DocumentState:
     for token, pred in zip(tokens, predictions):
         if token in ["[CLS]", "[SEP]", "[PAD]"]:
             continue
-
         label = NER_LABELS[pred]
-
         if label.startswith("B-"):
             if current_entity:
                 entities.append(current_entity)
-            current_entity = {
-                "text": token,
-                "type": label[2:]
-            }
+            current_entity = {"text": token, "type": label[2:]}
         elif label.startswith("I-") and current_entity:
             if token.startswith("##"):
-                # subword token - append without space
                 current_entity["text"] += token[2:]
             else:
-                # new word - append with space
                 current_entity["text"] += " " + token
         else:
             if current_entity:
@@ -321,19 +530,15 @@ def run_ner(state: DocumentState) -> DocumentState:
     state["entities"] = clean_entities(entities)
     return state
 
-# ---- Node 3: Classifier ----
+
 def run_classifier(state: DocumentState) -> DocumentState:
     text = state["text"]
+    rule_type = detect_document_type(text)
 
-    # Rule based detection first
-    rule_based_type = detect_document_type(text)
-
-    if rule_based_type != "General":
-        # Rule based was confident
-        state["doc_type"] = rule_based_type
+    if rule_type != "General":
+        state["doc_type"] = rule_type
         state["confidence"] = 1.0
     else:
-        # Fall back to ML classifier
         inputs = cls_tokenizer(
             text,
             return_tensors="pt",
@@ -341,65 +546,41 @@ def run_classifier(state: DocumentState) -> DocumentState:
             max_length=256,
             padding=True
         ).to(DEVICE)
-
         with torch.no_grad():
             outputs = cls_model(**inputs)
-
         probs = torch.softmax(outputs.logits, dim=-1).squeeze()
         pred_id = torch.argmax(probs).item()
-        confidence = probs[pred_id].item()
-
         state["doc_type"] = CLASSIFIER_LABELS[pred_id]
-        state["confidence"] = round(confidence, 4)
+        state["confidence"] = round(probs[pred_id].item(), 4)
 
-    # Extract specialized fields
     state["extracted_fields"] = extract_fields(state["doc_type"], text)
-
     return state
 
-HF_API_URL = "https://api-inference.huggingface.co/models/facebook/bart-large-cnn"
-HF_TOKEN = os.getenv("HF_TOKEN")
-HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
 
 def run_summarizer(state: DocumentState) -> DocumentState:
-    text = state["text"]
     doc_type = state["doc_type"]
+    text = state["text"]
     entities = state["entities"]
+    extracted_fields = state["extracted_fields"]
 
-    entity_names = [e["text"] for e in entities]
-    entity_str = ", ".join(entity_names) if entity_names else "none"
+    structured_types = ["Invoice", "Email", "Support Ticket"]
 
-    sentences = [s.strip() for s in text.split(".") if len(s.strip()) > 20]
-
-    if len(sentences) <= 2:
-        summary = text.strip()
+    if doc_type in structured_types:
+        # Use precise structured summary — no BART needed
+        # BART would garble structured summaries
+        state["summary"] = generate_structured_summary(
+            doc_type, text, entities, extracted_fields
+        )
     else:
-        scored = []
-        for i, sent in enumerate(sentences):
-            score = 0
-            if i == 0:
-                score += 3
-            for entity in entity_names:
-                if entity.lower() in sent.lower():
-                    score += 2
-            score += max(0, 3 - len(sent.split()) // 20)
-            scored.append((score, sent))
+        # Use BART for news/general — this is what BART is designed for
+        state["summary"] = generate_bart_summary(text, entities)
 
-        top_sentences = sorted(scored, reverse=True)[:2]
-        ordered = [s for _, s in sorted(
-            [(sentences.index(s), s) for _, s in top_sentences]
-        )]
-        summary = ". ".join(ordered) + "."
-
-    state["summary"] = summary
     return state
 
-# ---- Node 5: Vector Store ----
+
 def run_vector_store(state: DocumentState) -> DocumentState:
     text = state["text"]
     doc_id = state["doc_id"]
-
-    # Store document
     embedding = embedder.encode(text).tolist()
     collection.upsert(
         documents=[text],
@@ -410,52 +591,30 @@ def run_vector_store(state: DocumentState) -> DocumentState:
             "summary": state["summary"]
         }]
     )
-
-    # Find similar documents
-    results = collection.query(
-        query_embeddings=[embedding],
-        n_results=min(3, collection.count())
-    )
-
-    similar = []
-    if results["documents"][0]:
-        for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
-            if doc != text:
-                similar.append({
-                    "text": doc[:200],
-                    "doc_type": meta.get("doc_type", ""),
-                    "summary": meta.get("summary", "")
-                })
-
-    state["similar_docs"] = similar
     return state
 
-# ---- Build LangGraph ----
+
+# ================================================================
+# BUILD AND RUN PIPELINE
+# ================================================================
 def build_pipeline():
     graph = StateGraph(DocumentState)
-
-    # Add nodes
     graph.add_node("preprocess", preprocess)
     graph.add_node("ner", run_ner)
     graph.add_node("classifier", run_classifier)
     graph.add_node("summarizer", run_summarizer)
     graph.add_node("vector_store", run_vector_store)
-
-    # Add edges
     graph.set_entry_point("preprocess")
     graph.add_edge("preprocess", "ner")
     graph.add_edge("ner", "classifier")
     graph.add_edge("classifier", "summarizer")
     graph.add_edge("summarizer", "vector_store")
     graph.add_edge("vector_store", END)
-
     return graph.compile()
 
 
-# ---- Run Pipeline ----
 def analyze_document(text: str) -> Dict[str, Any]:
-    pipeline = build_pipeline()
-
+    p = build_pipeline()
     initial_state = DocumentState(
         text=text,
         entities=[],
@@ -463,38 +622,15 @@ def analyze_document(text: str) -> Dict[str, Any]:
         confidence=0.0,
         summary="",
         doc_id="",
-        similar_docs=[],
         extracted_fields={},
         error=""
     )
-
-    result = pipeline.invoke(initial_state)
-
+    result = p.invoke(initial_state)
     return {
         "doc_id": result["doc_id"],
         "doc_type": result["doc_type"],
         "confidence": result["confidence"],
         "entities": result["entities"],
         "summary": result["summary"],
-        "similar_docs": result["similar_docs"],
         "extracted_fields": result["extracted_fields"]
     }
-
-# ---- Test ----
-if __name__ == "__main__":
-    test_text = """
-    Apple Inc reported record quarterly earnings yesterday as CEO Tim Cook 
-    announced strong iPhone sales in Asia. The company based in Cupertino 
-    California saw revenues rise 15 percent driven by services growth. 
-    Goldman Sachs raised their price target following the announcement.
-    """
-
-    print("Analyzing document...")
-    result = analyze_document(test_text)
-
-    print("\n=== RESULTS ===")
-    print(f"Document ID: {result['doc_id']}")
-    print(f"Document Type: {result['doc_type']} (confidence: {result['confidence']})")
-    print(f"\nEntities Found: {result['entities']}")
-    print(f"\nSummary: {result['summary']}")
-    print(f"\nSimilar Documents: {result['similar_docs']}")

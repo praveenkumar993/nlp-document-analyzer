@@ -1,0 +1,30 @@
+services:
+  # FastAPI Backend
+  - type: web
+    name: doculens-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: HF_TOKEN
+        sync: false
+      - key: PYTHON_ENV
+        value: production
+    disk:
+      name: doculens-data
+      mountPath: /app/data
+      sizeGB: 1
+    healthCheckPath: /health
+
+  # Streamlit Frontend
+  - type: web
+    name: doculens-ui
+    runtime: docker
+    dockerfilePath: ./Dockerfile.streamlit
+    plan: free
+    envVars:
+      - key: API_URL
+        fromService:
+          name: doculens-api
+          type: web
+          property: host
