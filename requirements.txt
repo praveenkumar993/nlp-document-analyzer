@@ -11,6 +11,7 @@ uvicorn==0.24.0
 pydantic==2.5.0
 python-dotenv==1.0.0
 starlette>=0.40.0
+
 # ------------------------------------------------
 # HTTP & Networking
 # ------------------------------------------------
@@ -24,6 +25,7 @@ aiohttp==3.13.5
 torch>=2.2.0
 transformers>=4.40.0
 sentence-transformers==2.7.0
+spacy==3.7.4
 
 langgraph==0.0.20
 langchain==0.1.0
@@ -61,3 +63,4 @@ charset-normalizer==3.3.2
 idna==3.6
 urllib3==2.1.0
 jsonschema==4.20.0
+huggingface_hub>=0.20.0
